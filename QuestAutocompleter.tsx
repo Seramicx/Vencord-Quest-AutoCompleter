@@ -41,6 +41,7 @@ let processingQuests = false;
 let questQueue: any[] = [];
 let pollInterval: ReturnType<typeof setInterval> | null = null;
 let fluxUnsubs: (() => void)[] = [];
+let sessionDebounce: ReturnType<typeof setTimeout> | null = null;
 
 // ── Utility ───────────────────────────────────────────────────────────────────
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
@@ -83,7 +84,6 @@ function initStores(): boolean {
         )?.exports?.Z;
 
         if (!ApplicationStreamingStore) {
-            // Newer Discord bundle layout
             ApplicationStreamingStore = Object.values(wpRequire.c).find((x: any) =>
                 x?.exports?.A?.__proto__?.getStreamerActiveStreamMetadata
             )?.exports?.A;
@@ -94,7 +94,6 @@ function initStores(): boolean {
             FluxDispatcher    = Object.values(wpRequire.c).find((x: any) => x?.exports?.h?.__proto__?.flushWaitQueue)?.exports?.h;
             api               = Object.values(wpRequire.c).find((x: any) => x?.exports?.Bo?.get)?.exports?.Bo;
         } else {
-            // Older Discord bundle layout
             RunningGameStore  = Object.values(wpRequire.c).find((x: any) => x?.exports?.ZP?.getRunningGames)?.exports?.ZP;
             QuestsStore       = Object.values(wpRequire.c).find((x: any) => x?.exports?.Z?.__proto__?.getQuest)?.exports?.Z;
             ChannelStore      = Object.values(wpRequire.c).find((x: any) => x?.exports?.Z?.__proto__?.getAllThreadsForParent)?.exports?.Z;
@@ -213,37 +212,45 @@ function syncQueueFromStore() {
     }
 }
 
-async function scan() {
+function scan() {
     if (!initialized) return;
 
-    const newlyEnrolled = await autoAcceptAvailableQuests();
-    if (newlyEnrolled) await sleep(1500);
-
+    // Sync already-enrolled quests immediately so the queue starts without delay
     syncQueueFromStore();
+
+    // Auto-accept runs in the background; syncs again when done so newly
+    // enrolled quests get picked up without blocking the existing queue
+    autoAcceptAvailableQuests().then(enrolled => {
+        if (enrolled) setTimeout(() => syncQueueFromStore(), 1500);
+    });
 }
 
-// ── Session init (called on CONNECTION_OPEN and on manual plugin enable) ──────
+// ── Session init ──────────────────────────────────────────────────────────────
 function startSession() {
-    // Reset any stale state from a previous session
-    initialized      = false;
-    processingQuests = false;
-    questQueue       = [];
+    // Debounce rapid CONNECTION_OPEN bursts (multiple gateway shards)
+    if (sessionDebounce !== null) clearTimeout(sessionDebounce);
 
-    if (pollInterval !== null) {
-        clearInterval(pollInterval);
-        pollInterval = null;
-    }
+    sessionDebounce = setTimeout(() => {
+        sessionDebounce  = null;
+        initialized      = false;
+        processingQuests = false;
+        questQueue       = [];
 
-    // Give Discord a moment to finish hydrating its stores after connecting
-    setTimeout(() => {
+        if (pollInterval !== null) {
+            clearInterval(pollInterval);
+            pollInterval = null;
+        }
+
+        // Initialize stores immediately — no extra delay.
+        // Quest DATA may not have arrived yet (QUESTS_FETCH_SUCCESS handles that),
+        // but the store objects themselves are ready as soon as CONNECTION_OPEN fires.
         if (!initStores()) return;
-
-        // Fallback poll every 60s, catches anything that slipped through
-        // and re-attempts auto-accept for newly available quests
         pollInterval = setInterval(() => scan(), 60_000);
 
+        // Do an immediate scan in case QUESTS_FETCH_SUCCESS already fired
+        // (e.g. plugin enabled mid-session) or quests are already in the store
         scan();
-    }, 2000);
+    }, 500); // 500ms is enough to let the last shard connect; no need for 2s
 }
 
 // ── Processing loop ───────────────────────────────────────────────────────────
@@ -273,32 +280,36 @@ function doJob() {
         let completed = false;
 
         (async () => {
-            while (true) {
-                const maxAllowed = Math.floor((Date.now() - enrolledAt) / 1000) + maxFuture;
-                const diff = maxAllowed - secondsDone;
-                const timestamp = secondsDone + speed;
+            try {
+                while (true) {
+                    const maxAllowed = Math.floor((Date.now() - enrolledAt) / 1000) + maxFuture;
+                    const diff = maxAllowed - secondsDone;
+                    const timestamp = secondsDone + speed;
 
-                if (diff >= speed) {
-                    const res = await api.post({
-                        url: `/quests/${quest.id}/video-progress`,
-                        body: { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) }
-                    });
-                    completed = res.body.completed_at != null;
-                    secondsDone = Math.min(secondsNeeded, timestamp);
+                    if (diff >= speed) {
+                        const res = await api.post({
+                            url: `/quests/${quest.id}/video-progress`,
+                            body: { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) }
+                        });
+                        completed = res.body.completed_at != null;
+                        secondsDone = Math.min(secondsNeeded, timestamp);
+                    }
+
+                    if (timestamp >= secondsNeeded) break;
+                    await sleep(interval * 1000);
                 }
 
-                if (timestamp >= secondsNeeded) break;
-                await sleep(interval * 1000);
-            }
+                if (!completed) {
+                    await api.post({
+                        url: `/quests/${quest.id}/video-progress`,
+                        body: { timestamp: secondsNeeded }
+                    });
+                }
 
-            if (!completed) {
-                await api.post({
-                    url: `/quests/${quest.id}/video-progress`,
-                    body: { timestamp: secondsNeeded }
-                });
+                log(`Completed: ${questName}`);
+            } catch (e) {
+                log(`Error completing "${questName}":`, e);
             }
-
-            log(`Completed: ${questName}`);
             doJob();
         })();
 
@@ -312,52 +323,76 @@ function doJob() {
             return;
         }
 
-        api.get({ url: `/applications/public?application_ids=${applicationId}` }).then((res: any) => {
-            const appData = res.body[0];
-            const exeName = appData.executables.find((x: any) => x.os === "win32").name.replace(">", "");
+        api.get({ url: `/applications/public?application_ids=${applicationId}` })
+            .then((res: any) => {
+                const appData = res.body?.[0];
 
-            const fakeGame = {
-                cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
-                exeName,
-                exePath: `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
-                hidden: false,
-                isLauncher: false,
-                id: applicationId,
-                name: appData.name,
-                pid,
-                pidPath: [pid],
-                processName: appData.name,
-                start: Date.now(),
-            };
-
-            const realGames           = RunningGameStore.getRunningGames();
-            const realGetRunningGames = RunningGameStore.getRunningGames;
-            const realGetGameForPID   = RunningGameStore.getGameForPID;
-
-            RunningGameStore.getRunningGames = () => [fakeGame];
-            RunningGameStore.getGameForPID   = (p: number) => (p === fakeGame.pid ? fakeGame : undefined);
-            FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: realGames, added: [fakeGame], games: [fakeGame] });
-
-            const fn = (data: any) => {
-                const progress = quest.config.configVersion === 1
-                    ? data.userStatus.streamProgressSeconds
-                    : Math.floor(data.userStatus.progress.PLAY_ON_DESKTOP.value);
-
-                log(`[${questName}] Progress: ${progress}/${secondsNeeded}`);
-
-                if (progress >= secondsNeeded) {
-                    log(`Completed: ${questName}`);
-                    RunningGameStore.getRunningGames = realGetRunningGames;
-                    RunningGameStore.getGameForPID   = realGetGameForPID;
-                    FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: [], games: [] });
-                    FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                if (!appData) {
+                    log(`No app data returned for "${questName}" – skipping`);
                     doJob();
+                    return;
                 }
-            };
 
-            FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
-            log(`Spoofed game: ${applicationName} – ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min left`);
-        });
+                // Find a win32 executable; fall back to any executable; fall back to a generic name
+                const win32Exe = appData.executables?.find((x: any) => x.os === "win32");
+                const anyExe   = appData.executables?.[0];
+                const exeName  = (win32Exe ?? anyExe)?.name?.replace(">", "") ?? `${appData.name}.exe`;
+
+                const fakeGame = {
+                    cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
+                    exeName,
+                    exePath: `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
+                    hidden: false,
+                    isLauncher: false,
+                    id: applicationId,
+                    name: appData.name,
+                    pid,
+                    pidPath: [pid],
+                    processName: appData.name,
+                    start: Date.now(),
+                };
+
+                const realGames           = RunningGameStore.getRunningGames();
+                const realGetRunningGames = RunningGameStore.getRunningGames;
+                const realGetGameForPID   = RunningGameStore.getGameForPID;
+
+                RunningGameStore.getRunningGames = () => [fakeGame];
+                RunningGameStore.getGameForPID   = (p: number) => (p === fakeGame.pid ? fakeGame : undefined);
+                FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: realGames, added: [fakeGame], games: [fakeGame] });
+
+                const fn = (data: any) => {
+                    try {
+                        const progress = quest.config.configVersion === 1
+                            ? data.userStatus.streamProgressSeconds
+                            : Math.floor(data.userStatus.progress.PLAY_ON_DESKTOP.value);
+
+                        log(`[${questName}] Progress: ${progress}/${secondsNeeded}`);
+
+                        if (progress >= secondsNeeded) {
+                            log(`Completed: ${questName}`);
+                            RunningGameStore.getRunningGames = realGetRunningGames;
+                            RunningGameStore.getGameForPID   = realGetGameForPID;
+                            FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: [], games: [] });
+                            FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                            doJob();
+                        }
+                    } catch (e) {
+                        log(`Error in heartbeat handler for "${questName}":`, e);
+                        RunningGameStore.getRunningGames = realGetRunningGames;
+                        RunningGameStore.getGameForPID   = realGetGameForPID;
+                        FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: [], games: [] });
+                        FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                        doJob();
+                    }
+                };
+
+                FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                log(`Spoofed game: ${applicationName} – ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min left`);
+            })
+            .catch((e: any) => {
+                log(`Failed to fetch app data for "${questName}":`, e);
+                doJob();
+            });
 
     // ── STREAM_ON_DESKTOP ─────────────────────────────────────────────────────
     } else if (taskName === "STREAM_ON_DESKTOP") {
@@ -375,14 +410,21 @@ function doJob() {
         });
 
         const fn = (data: any) => {
-            const progress = quest.config.configVersion === 1
-                ? data.userStatus.streamProgressSeconds
-                : Math.floor(data.userStatus.progress.STREAM_ON_DESKTOP.value);
+            try {
+                const progress = quest.config.configVersion === 1
+                    ? data.userStatus.streamProgressSeconds
+                    : Math.floor(data.userStatus.progress.STREAM_ON_DESKTOP.value);
 
-            log(`[${questName}] Progress: ${progress}/${secondsNeeded}`);
+                log(`[${questName}] Progress: ${progress}/${secondsNeeded}`);
 
-            if (progress >= secondsNeeded) {
-                log(`Completed: ${questName}`);
+                if (progress >= secondsNeeded) {
+                    log(`Completed: ${questName}`);
+                    ApplicationStreamingStore.getStreamerActiveStreamMetadata = realFunc;
+                    FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                    doJob();
+                }
+            } catch (e) {
+                log(`Error in heartbeat handler for "${questName}":`, e);
                 ApplicationStreamingStore.getStreamerActiveStreamMetadata = realFunc;
                 FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
                 doJob();
@@ -408,26 +450,30 @@ function doJob() {
         const streamKey = `call:${channelId}:1`;
 
         (async () => {
-            log(`Activity: ${questName}`);
-            while (true) {
-                const res = await api.post({
-                    url: `/quests/${quest.id}/heartbeat`,
-                    body: { stream_key: streamKey, terminal: false }
-                });
-                const progress = res.body.progress.PLAY_ACTIVITY.value;
-                log(`[${questName}] Progress: ${progress}/${secondsNeeded}`);
-
-                if (progress >= secondsNeeded) {
-                    await api.post({
+            try {
+                log(`Activity: ${questName}`);
+                while (true) {
+                    const res = await api.post({
                         url: `/quests/${quest.id}/heartbeat`,
-                        body: { stream_key: streamKey, terminal: true }
+                        body: { stream_key: streamKey, terminal: false }
                     });
-                    break;
-                }
+                    const progress = res.body.progress.PLAY_ACTIVITY.value;
+                    log(`[${questName}] Progress: ${progress}/${secondsNeeded}`);
 
-                await sleep(20000);
+                    if (progress >= secondsNeeded) {
+                        await api.post({
+                            url: `/quests/${quest.id}/heartbeat`,
+                            body: { stream_key: streamKey, terminal: true }
+                        });
+                        break;
+                    }
+
+                    await sleep(20000);
+                }
+                log(`Completed: ${questName}`);
+            } catch (e) {
+                log(`Error completing "${questName}":`, e);
             }
-            log(`Completed: ${questName}`);
             doJob();
         })();
     }
@@ -443,8 +489,6 @@ export default definePlugin({
     start() {
         log("Starting...");
 
-        // Bootstrap FluxDispatcher early (before full initStores) so we can
-        // subscribe to events immediately
         const bootstrapFlux = (): any => {
             try {
                 const wpRequire = (window as any).webpackChunkdiscord_app.push([[Symbol()], {}, (r: any) => r]);
@@ -462,32 +506,41 @@ export default definePlugin({
             return;
         }
 
-        // CONNECTION_OPEN fires on first load, page reload, AND account switch
-        // fresh session scenario
+        // CONNECTION_OPEN covers: first load, page reload, account switch
         const onConnectionOpen = () => {
             log("CONNECTION_OPEN – starting new session...");
             startSession();
         };
 
-        // Fires whenever your status on a quest changes (accept, progress, complete).
-        // This makes quest acceptance detection instant, no plugin reload needed.
+        // Fires when Discord finishes fetching the quest list from the server.
+        // This is the key trigger — quest data often arrives during or after
+        // the CONNECTION_OPEN debounce window, so we must handle it here.
+        // Also ensures stores are initialized if the event fires before startSession completes.
+        const onQuestsFetched = () => {
+            log("QUESTS_FETCH_SUCCESS – quests loaded, scanning...");
+            if (!initialized) initStores();
+            scan();
+        };
+
+        // Instant detection when you manually accept a quest
         const onStatusUpdate = () => {
             log("QUEST_USER_STATUS_UPDATE – syncing queue...");
-            // Small delay so the store has time to persist the update first
             setTimeout(() => syncQueueFromStore(), 500);
         };
 
         earlyFlux.subscribe("CONNECTION_OPEN", onConnectionOpen);
+        earlyFlux.subscribe("QUESTS_FETCH_SUCCESS", onQuestsFetched);
         earlyFlux.subscribe("QUEST_USER_STATUS_UPDATE", onStatusUpdate);
 
         fluxUnsubs = [
             () => earlyFlux.unsubscribe("CONNECTION_OPEN", onConnectionOpen),
+            () => earlyFlux.unsubscribe("QUESTS_FETCH_SUCCESS", onQuestsFetched),
             () => earlyFlux.unsubscribe("QUEST_USER_STATUS_UPDATE", onStatusUpdate),
         ];
 
-        // If the plugin is enabled mid-session (e.g. via plugin manager while
-        // Discord is already running), CONNECTION_OPEN won't fire again - so
-        // kick off a session manually right now
+        // If enabled mid-session via plugin manager, CONNECTION_OPEN won't fire
+        // startSession() has a guard so if CONNECTION_OPEN fires first within
+        // the 2s window, the manual call here becomes a no-op
         startSession();
     },
 
@@ -505,5 +558,6 @@ export default definePlugin({
         questQueue       = [];
         processingQuests = false;
         initialized      = false;
+        if (sessionDebounce !== null) { clearTimeout(sessionDebounce); sessionDebounce = null; }
     }
 });
