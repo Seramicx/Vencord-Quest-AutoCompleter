@@ -33,7 +33,7 @@ Some tasks require the Discord desktop app and will be skipped on web.
 ## Installation
 
 1. Place the plugin file at:
-   `src/userplugins/questAutocompleter/index.tsx`
+   `src/plugins/questAutocompleter/index.tsx`
 2. Rebuild Vencord:
    - In your Vencord repository folder run:
      ```
