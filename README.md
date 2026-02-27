@@ -32,11 +32,17 @@ Some tasks require the Discord desktop app and will be skipped on web.
 
 ## Installation
 
-1. Put `QuestAutocompleter.tsx` in your Vencord plugins folder
-2. Rebuild Vencord using `pnpm build` in your Vencord folder
-3. Enable the plugin in the plugin manager
-4. (Optional) turn on auto-accept in settings
-
+1. Place the plugin file at:
+   `src/userplugins/questAutocompleter/index.tsx`
+2. Rebuild Vencord:
+   - In your Vencord repository folder run:
+     ```
+     pnpm build
+     ```
+3. Restart Discord and enable the plugin:
+   - Open Vencord → Settings → Plugins and enable `QuestAutocompleter`.
+4. (Optional) Enable auto-accept:
+   - In the plugin settings, toggle "Auto-accept quests" to have the plugin automatically enroll available quests.
 Note: Vencord must be built from source in order to use this plugin. For more information, check out: https://docs.vencord.dev/installing/
 
 ## Credit
